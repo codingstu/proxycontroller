@@ -322,6 +322,9 @@ def _force_switch_region(reg):
         if standby_tun.ready and standby_tun.process and standby_tun.process.poll() is None:
             proxy_server.ACTIVE_BINDS[reg.port] = standby_tun.name
             print(f"[*] 地区 [{reg.idx}] 软开关秒切至备用: {standby_tun.egress_ip or standby_tun.entry_ip}", flush=True)
+        else:
+            proxy_server.ACTIVE_BINDS.pop(reg.port, None)
+            print(f"[*] 地区 [{reg.idx}] 备用通道也不可用，清除绑定，等待重拨...", flush=True)
 
 def _kill_region_tunnels(reg):
     with state_lock:
@@ -645,6 +648,7 @@ def _maintain_region(reg):
                     except: reg.main.process.kill()
                 reg.main.process = None; reg.main.ready = False; reg.main.is_connecting = False
                 reg.main.entry_ip = ""; reg.main.egress_ip = ""
+                proxy_server.ACTIVE_BINDS.pop(reg.port, None)
     with state_lock:
         needs_main = not reg.main.ready and not reg.main.is_connecting
         needs_backup = not reg.backup.ready and not reg.backup.is_connecting
