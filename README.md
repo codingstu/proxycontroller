@@ -17,9 +17,9 @@ wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
 
 ```
 
-# 免费住宅IP代理调度系统 (Active-Standby 终极版) 🌐
+# 免费住宅IP代理调度系统 (多地区主备双活 终极版) 🌐
 
-这是一个轻量级且极具韧性的智能代理调度系统。基于 Cloudflare Workers 与 D1 数据库构建中心控制节点，配合 VPS 守护进程，实现 **主备双活 (Active-Standby)** 无缝切换、自动优选纯净住宅 IP 的 Socks5/HTTP 代理服务。
+这是一个轻量级且极具韧性的智能代理调度系统。基于 Cloudflare Workers 与 D1 数据库构建中心控制节点，配合 VPS 守护进程，实现 **多地区主备双活 (Multi-Region Active-Standby)** 无缝切换、自动优选纯净住宅 IP 的 Socks5/HTTP 代理服务。
 
 系统资源占用极低，同时集成了顶级的 IP 资产测绘引擎，非常适合用于个人量化交易、跨境电商防关联、网络测试或高频数据抓取。
 
@@ -32,7 +32,8 @@ wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
 
 ## ✨ 核心特性
 
-* **⚔️ 主备双活引擎 (Active-Standby)**：彻底重构底层网络，双路隧道 (`tun_main` / `tun_backup`) 并发建连。当主卡突发断流或死亡时，软开关秒级接管业务至备用卡，真正实现业务零感知切换。
+* **⚔️ 多地区主备双活引擎 (Multi-Region Active-Standby)**：单台 VPS 同时运行多个地区的隧道对，每个地区独立主备双路 (`tun_rNm` / `tun_rNb`)，支持动态增删地区，软开关秒级接管业务。
+* **🌐 多地区独立调度**：每个地区独立下发国家策略、独立强制更换 IP，互不干扰。强制换 IP 时保留备用通道不中断业务。
 * **🏠 双ISP住宅IP检测**：内置原生判定逻辑，无缝对接 https://testisp.info  执行 BGP 宣告审计、rDNS 探测、Geo-Drift 物理偏移计算与 Spamhaus 全球蜜罐预警，冷酷剔除一切机房 (Hosting/Datacenter) 伪装 IP。
 * **⚡ 毫秒级极速调度与容错**：多维 HTTP/ICMP 探针高频心跳检测，采用 5 秒超时设定与高频蓄水池抓取机制，节点假死后立刻踢线熔断。
 * **🔄 主动热切与端口云控**：支持面板一键发送时间戳指令强制清退当前通道并重拨；支持云端下发服务端口变更指令，守护进程自动重启适配。
@@ -104,8 +105,8 @@ bash <(curl -sL (https://您的worker域名.workers.dev/agent))
 
 直接在浏览器访问您的 Worker 域名进入总控中心。
 
-* **策略下发与端口云配**：在主控区输入目标国家代码（如 `JP`, `US`, `GB`）并可动态修改节点监听端口（默认 `7920`）。点击**下发策略**，Agent 将在下一次心跳周期（~15s）内无缝应用。
-* **强制斩断与重拨**：点击紫色的**强制更换 IP**，系统将瞬间销毁当前双活通道，将物理 IP 关入黑名单，并从底层重新拉起建连。
+* **策略下发与端口云配**：在主控区动态添加/删除地区卡片，每个地区设置国家代码（如 `JP`, `US`, `GB`）和独立端口（默认 `7920` 递增）。点击**下发全部策略**，Agent 将在下一次心跳周期（~15s）内无缝应用。
+* **强制斩断与重拨**：每个地区独立点击紫色的**强制更换 IP**，系统仅清退该地区的活跃通道（保留备用通道继续承载业务），将物理 IP 关入黑名单，并从底层重新拉起建连。
 * **TestISP 深度质检报告**：面板下方自动生成当前活跃出口 (Active) 的深度体检报告（包含原生性、运营类型、Spamhaus 情报等）。点击右上角**原版页面**，系统会自动将该 IP 复制到您的剪贴板并跳转至 TestISP.info 官网供您比对查验。
 * **实时 Auto-Sync 日志流**：面板底部可直接窥视 VPS 母机的实时运行日志，方便排查故障。
 
@@ -132,7 +133,7 @@ http://<PROXY_USER>:<PROXY_PASS>@<VPS母机IP>:<服务端口>
 
 ## 🗑️ 终极卸载命令
 
-如需彻底移除 VPS 上的节点调度程序并恢复网络路由状态，请执行以下命令（已适配双活表 101/102）：
+如需彻底移除 VPS 上的节点调度程序并恢复网络路由状态，请执行以下命令（已适配多地区隧道命名）：
 
 ```bash
 # 1. 停止并禁用守护进程
@@ -144,21 +145,21 @@ systemctl daemon-reload
 # 2. 强杀残留的 Python 调度器和 OpenVPN 进程
 pkill -f "lite_manager.py" 2>/dev/null
 pkill -f "proxy_server.py" 2>/dev/null
-pkill -f "openvpn.*tun_main|tun_backup" 2>/dev/null
+pkill -f "openvpn.*tun_r" 2>/dev/null
 
-# 3. 清理主备双路策略路由 (防止宿主机断网)
-ip rule del lookup 101 pref 101 2>/dev/null
-ip rule del lookup 101 pref 1101 2>/dev/null
-ip route flush table 101 2>/dev/null
-ip rule del lookup 102 pref 102 2>/dev/null
-ip rule del lookup 102 pref 1102 2>/dev/null
-ip route flush table 102 2>/dev/null
+# 3. 清理所有地区策略路由 (表 200-901)
+for i in $(seq 0 9); do
+    for t in $((200+i*100)) $((201+i*100)); do
+        ip rule del pref $t 2>/dev/null
+        ip rule del pref $((t+1000)) 2>/dev/null
+        ip route flush table $t 2>/dev/null
+    done
+done
 
 # 4. 删除所有引擎代码和配置文件
 rm -rf /opt/proxy_lite
 
-echo "✅ 双活代理引擎及所有配置已彻底卸载清理完毕！"
-
+echo "✅ 多地区代理引擎及所有配置已彻底卸载清理完毕！"
 ```
 
 ---
