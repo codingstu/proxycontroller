@@ -1,94 +1,123 @@
-# 多地区主备双活引擎改造方案记录
+# Proxy Controller 更新记录
 
-## 修改概述
-
-本次修改将代理控制器从**单地区主备双活**架构升级为**单 VPS 多地区主备双活**架构，同时修复了强制更换 IP 时直链提取 API 返回为空的熔断 Bug。
+本文档记录多地区主备双活引擎及后续可用性修复。部署入口为 `src/index.js`，`worker.js` 作为同步副本保留一致。
 
 ---
 
-## Bug 修复：强制更换 IP 导致 API 返空
+## 2026-06-19 - 强可用节点保活与自动补新
 
-### 根因
+### 背景
 
-旧代码 `update_config_loop` 在收到 `switch_trigger` 指令时，**同时杀死** `tun_main` 和 `tun_backup` 两个通道。心跳上报 `details = []`（空数组），`/api/proxies` 找不到活跃节点，返回空字符串。重新拨号需要 20-60 秒。
+面板中出现 JP 节点不可用后仍停留在 `STANDBY`、没有立即重新获取新 IP 的情况。旧逻辑主要检查当前 Active 通道，且补新依赖维护循环的单次候选选择；当备用通道失效、候选池枯竭或绑定状态残留时，容易形成“看起来有通道但业务出口不可用”的半死状态。
 
-### 修复方案
+### 变更
 
-新增 `_force_switch_region()` 函数：强制换 IP 时**仅杀死活跃通道**，保留备用通道继续承载业务流量。`maintain_pool` 每 2 秒检测到活跃通道死亡后自动互换身份、补充新备用节点。代理业务永不中断。
+- 健康检查覆盖每个 ready 通道，不再只检查 Active。
+- 失败计数按 `region_idx + tunnel + entry_ip` 维度记录，连续 3 次失败后才判定不可用。
+- Active 失败时立即拉黑旧 IP、清理通道、切换到可用 Standby，并触发补新。
+- Standby 失败时不影响当前业务出口，只清理该备用并补齐新的热备通道。
+- 新通道连上后仅在当前地区没有可用 Active 时才写入 `ACTIVE_BINDS`，避免新备用抢占业务出口。
+- 新增 `_is_tunnel_live()`、`_clear_tunnel()`、`_select_active_tunnel_locked()` 等状态整理函数，统一处理通道存活、绑定修复和资源清理。
+- 新增 `_trigger_emergency_harvest()` 和 `_emergency_harvest()`，在候选枯竭、拨号失败、TestISP/YouTube 质检失败、探针连续失败时立即补充节点快照。
+- 候选池低于 4 个时提前收割；候选完全枯竭时只按国家范围兜底解锁黑名单，避免全局清空 `dead_ips`。
+- 移除旧的 10 分钟全局清空黑名单逻辑，降低刚失败 IP 被快速选回的概率。
 
-```python
-def _force_switch_region(reg):
-    active_name = proxy_server.ACTIVE_BINDS.get(reg.port, reg.main.name)
-    active_tun = reg.main if active_name == reg.main.name else reg.backup
-    standby_tun = reg.backup if active_tun == reg.main else reg.main
-    # 仅杀活跃，备用保持
-    ...
-    if standby_tun.ready:
-        proxy_server.ACTIVE_BINDS[reg.port] = standby_tun.name
-```
+### 行为结果
+
+- 每个地区持续尝试保持 1 个 Active + 1 个 Standby。
+- 任一通道连续探针失败后会自动踢线、切换或补新，无需手动强制换 IP。
+- 候选池不足时会主动刷新 VPNGate 快照，不再只等待 5 分钟定时抓取。
 
 ---
 
-## 多地区架构改造
+## 2026-06-15 - 清理死亡绑定与截图误提交
 
-### 核心设计
+### `2a934e6` - 清理双通道死亡后的 `ACTIVE_BINDS`
+
+当主备通道同时死亡时，旧逻辑可能保留 `ACTIVE_BINDS[port]` 指向已不存在的 TUN 设备名，导致 `SO_BINDTODEVICE` 绑定失败，代理连接被关闭。
+
+修复点：
+
+- `_maintain_region()` 在主备都不可用时清除对应端口绑定。
+- `_force_switch_region()` 在备用也不可用时清除对应端口绑定。
+- 新通道连上后由 `connect_node()` 重新设置正确绑定。
+
+### `aa4af95` - 移除误提交截图
+
+- 删除此前误提交的 `proxies_page.png` 和 `proxies_unauthorized.png`。
+- 保持仓库只保留源码、文档和配置文件。
+
+---
+
+## 2026-06-15 - 多地区主备双活引擎
+
+### 修改概述
+
+本次修改将代理控制器从单地区主备双活架构升级为单 VPS 多地区主备双活架构，同时修复强制更换 IP 时直链提取 API 返回为空的问题。
+
+### 强制更换 IP 熔断修复
+
+旧代码收到 `switch_trigger` 指令时会同时杀死 `tun_main` 和 `tun_backup`，心跳上报 `details = []`，导致 `/api/proxies` 找不到活跃节点并返回空字符串。
+
+修复后新增 `_force_switch_region()`：强制换 IP 时只清退当前活跃通道，备用通道继续承载业务。维护循环随后补充新的备用节点，避免强制换 IP 期间代理列表返空。
+
+### 多地区架构改造
 
 | 维度 | 旧架构 | 新架构 |
 |------|--------|--------|
-| 地区数 | 1 个（全局 `target_country`） | N 个（`Region` 类动态管理） |
+| 地区数 | 1 个，全局 `target_country` | N 个，`Region` 类动态管理 |
 | 隧道命名 | `tun_main` / `tun_backup` | `tun_r{idx}m` / `tun_r{idx}b` |
 | 路由表 | 101 / 102 | `200 + idx*100` / `201 + idx*100` |
-| 代理端口 | 1 个全局端口 | 每地区独立端口（默认 7920 递增） |
+| 代理端口 | 1 个全局端口 | 每地区独立端口，默认 7920 递增 |
 | 绑定机制 | `ACTIVE_BIND` 单字符串 | `ACTIVE_BINDS` 字典 `{port: tun_name}` |
 | 代理服务器 | 单端口监听 | 多端口 `select()` 监听 |
 | 配置格式 | `{"0": "JP", "port": 7920}` | `{"regions": [{idx, country, port, switch_trigger}]}` |
 
-### 新增函数
+### Agent 侧改造
 
-- `Region` 类：封装单地区的 idx/country/port/switch_trigger 和 main/backup 隧道对
-- `reconcile_regions(desired)`：协调地区增删，处理国家变更、端口变更、强制换 IP 触发
-- `_force_switch_region(reg)`：仅杀活跃通道的安全换 IP
-- `_kill_region_tunnels(reg)`：国家变更时杀掉该地区所有通道
-- `teardown_region(reg)`：移除地区时清理隧道进程、路由表、ACTIVE_BINDS
-- `_maintain_region(reg)`：单地区的主备故障切换 + 补充逻辑
-- `_health_check_region(reg)`：单地区的多维探针健康检查
-- `get_best_candidate_for(country)`：按国家过滤候选节点，排除所有地区已用 IP
+- `Region` 类封装每个地区的国家、端口、强制换 IP 触发值和主备隧道。
+- `reconcile_regions(desired)` 负责地区增删、国家变更、端口变更和强制换 IP。
+- `_kill_region_tunnels(reg)` 和 `teardown_region(reg)` 负责地区级通道和路由清理。
+- `_maintain_region(reg)` 负责单地区主备切换和补充。
+- `get_best_candidate_for(country)` 按国家过滤候选节点，并排除各地区已占用 IP。
 
 ### proxy_server.py 改造
 
-- `ACTIVE_BIND` → `ACTIVE_BINDS = {}` 字典
-- `create_connection` 新增 `listen_port` 参数，按端口查找绑定接口
-- `socks5_client` / `http_client` / `proxy_client` 全链路透传 `listen_port`
-- `start_proxy_server` 改为多端口 `select()` 监听器
+- `ACTIVE_BIND` 改为 `ACTIVE_BINDS = {}`。
+- `create_connection()` 新增 `listen_port` 参数，按监听端口选择绑定的隧道接口。
+- `socks5_client()`、`http_client()`、`proxy_client()` 全链路透传 `listen_port`。
+- `start_proxy_server()` 改为多端口 `select()` 监听。
 
 ### 服务端 API 改造
 
-- `GET /api/config`：返回 `{regions: [...]}` 数组，向后兼容旧格式
-- `POST /api/config`：接收 regions 数组，校验端口唯一性
-- `GET /api/proxies`：按 `region_idx` 分组，每地区输出独立代理行
+- `GET /api/config` 返回 `{regions: [...]}`，并兼容旧配置格式。
+- `POST /api/config` 接收 `regions` 数组并校验端口唯一性。
+- `GET /api/proxies` 按 `region_idx` 分组，每个地区输出独立代理行。
 
 ### Dashboard UI 改造
 
-- 单地区输入面板 → 动态地区卡片列表
-- 每个卡片：国家代码 + 端口 + 强制换 IP 按钮 + 删除按钮
-- "添加地区" / "下发全部策略" 全局操作
-- 节点表格负载率显示改为动态 `${count} 通道`
+- 单地区输入面板改为动态地区卡片列表。
+- 每个地区卡片支持国家代码、端口、强制换 IP 和删除操作。
+- 节点表格负载率改为动态通道数量显示。
 
 ---
 
-## 修改文件清单
+## 修改文件说明
 
-| 文件 | 变更类型 | 说明 |
-|------|----------|------|
-| `src/index.js` | 重大修改 | proxy_server 模板、lite_manager 模板、API、Dashboard UI、Agent 脚本 |
-| `worker.js` | 同步 | 与 src/index.js 完全一致 |
-| `README.md` | 更新 | 功能说明、卸载命令适配新隧道命名 |
+| 文件 | 说明 |
+|------|------|
+| `src/index.js` | Cloudflare Worker 入口，内嵌 `proxy_server.py`、`lite_manager.py`、API 和 Dashboard |
+| `worker.js` | 与 `src/index.js` 保持一致的同步副本 |
+| `README.md` | 部署说明、功能说明和卸载命令 |
+| `CHANGELOG-multi-region.md` | 多地区和强可用更新记录 |
 
 ---
 
-## 部署说明
+## 部署与验证
 
-- 部署入口：`src/index.js`（`wrangler.toml` 中 `main = "src/index.js"`）
-- 一键部署按钮从 GitHub 仓库拉取代码，推送到 GitHub 后即可部署新代码
-- 旧 Agent 重新运行 `/agent` 命令即可获得多地区版本
-- D1 数据库无需 Schema 变更，旧配置自动迁移
+- 部署 Worker 后，VPS 需要重新运行 `/agent` 或手动重新拉取 `/scripts/lite_manager.py` 与 `/scripts/proxy_server.py`，再重启 `proxy-lite.service`。
+- D1 数据库无需 Schema 变更，旧配置会自动兼容为 `regions` 格式。
+- 建议通过 `journalctl -u proxy-lite.service -f` 观察：
+  - Active 探针失败与秒切日志；
+  - Standby 失败后的补齐日志；
+  - 候选低水位或枯竭时的紧急收割日志。

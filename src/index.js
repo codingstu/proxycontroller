@@ -234,7 +234,7 @@ def start_proxy_server(host: str, ports: list) -> None:
 
     if (url.pathname === "/scripts/lite_manager.py") {
       const MANAGER_CODE = `#!/usr/bin/env python3
-import base64, csv, os, subprocess, threading, time, urllib.request, json
+import base64, csv, os, socket, subprocess, threading, time, urllib.request, json
 from pathlib import Path
 import proxy_server
 
@@ -252,11 +252,17 @@ PROXY_PORT = 7920
 
 state_lock = threading.Lock()
 dead_ips = set()
-last_blacklist_clear = time.time()
 public_ip = ""
 
 global_node_reservoir = {} 
 reservoir_lock = threading.Lock()
+harvest_signal_lock = threading.Lock()
+emergency_harvest_inflight = set()
+last_emergency_harvest_at = {}
+
+HEALTH_FAIL_THRESHOLD = 3
+LOW_WATERMARK_PER_COUNTRY = 4
+EMERGENCY_HARVEST_COOLDOWN = 45
 
 class Tunnel:
     def __init__(self, name: str, table_id: int):
@@ -277,6 +283,7 @@ class Region:
         self.country = country
         self.port = port
         self.switch_trigger = 0
+        self.connect_fail_streak = 0
         base_table = 200 + idx * 100
         self.main = Tunnel(f"tun_r{idx}m", base_table)
         self.backup = Tunnel(f"tun_r{idx}b", base_table + 1)
@@ -305,43 +312,82 @@ def get_recent_logs():
         return res.stdout
     except: return "Waiting for logs..."
 
+def _is_tunnel_live(tun):
+    return bool(tun.ready and tun.process and tun.process.poll() is None)
+
+def _clear_tunnel(tun, kill_process: bool = True):
+    proc = tun.process
+    if kill_process and proc:
+        try: proc.terminate(); proc.wait(2)
+        except:
+            try: proc.kill()
+            except: pass
+    tun.process = None
+    tun.node = None
+    tun.entry_ip = ""
+    tun.egress_ip = ""
+    tun.country = ""
+    tun.ready = False
+    tun.connected_at = 0
+    tun.is_connecting = False
+
+def _select_active_tunnel_locked(reg):
+    active_name = proxy_server.ACTIVE_BINDS.get(reg.port)
+    for tun in [reg.main, reg.backup]:
+        if tun.name == active_name and _is_tunnel_live(tun):
+            return tun
+    for tun in [reg.main, reg.backup]:
+        if _is_tunnel_live(tun):
+            proxy_server.ACTIVE_BINDS[reg.port] = tun.name
+            print(f"[*] ⚡ 地区 [{reg.idx}] 绑定修复，切换 Active 至: {tun.egress_ip or tun.entry_ip}", flush=True)
+            return tun
+    proxy_server.ACTIVE_BINDS.pop(reg.port, None)
+    return None
+
+def _trigger_emergency_harvest(country, reason="候选不足"):
+    country = str(country).upper()
+    with harvest_signal_lock:
+        if country in emergency_harvest_inflight:
+            return
+        now = time.time()
+        if now - last_emergency_harvest_at.get(country, 0) < EMERGENCY_HARVEST_COOLDOWN:
+            return
+        last_emergency_harvest_at[country] = now
+        emergency_harvest_inflight.add(country)
+    def _runner():
+        try:
+            _emergency_harvest(country, reason)
+        finally:
+            with harvest_signal_lock:
+                emergency_harvest_inflight.discard(country)
+    threading.Thread(target=_runner, daemon=True).start()
+
 def _force_switch_region(reg):
-    active_name = proxy_server.ACTIVE_BINDS.get(reg.port, reg.main.name)
-    if active_name == reg.main.name:
-        active_tun, standby_tun = reg.main, reg.backup
-    else:
-        active_tun, standby_tun = reg.backup, reg.main
     print(f"[*] 地区 [{reg.idx}] 强制更换 IP，仅清退活跃通道...", flush=True)
     with state_lock:
+        active_tun = _select_active_tunnel_locked(reg) or reg.main
+        standby_tun = reg.backup if active_tun == reg.main else reg.main
         if active_tun.entry_ip: dead_ips.add(active_tun.entry_ip)
-        if active_tun.process:
-            try: active_tun.process.terminate(); active_tun.process.wait(2)
-            except: active_tun.process.kill()
-        active_tun.ready = False; active_tun.process = None
-        active_tun.entry_ip = ""; active_tun.egress_ip = ""
-        if standby_tun.ready and standby_tun.process and standby_tun.process.poll() is None:
+        _clear_tunnel(active_tun)
+        if _is_tunnel_live(standby_tun):
             proxy_server.ACTIVE_BINDS[reg.port] = standby_tun.name
             print(f"[*] 地区 [{reg.idx}] 软开关秒切至备用: {standby_tun.egress_ip or standby_tun.entry_ip}", flush=True)
         else:
             proxy_server.ACTIVE_BINDS.pop(reg.port, None)
             print(f"[*] 地区 [{reg.idx}] 备用通道也不可用，清除绑定，等待重拨...", flush=True)
+    _trigger_emergency_harvest(reg.country, "强制换 IP 后立即预取")
 
 def _kill_region_tunnels(reg):
     with state_lock:
         for tun in [reg.main, reg.backup]:
             if tun.entry_ip: dead_ips.add(tun.entry_ip)
-            if tun.process:
-                try: tun.process.terminate(); tun.process.wait(2)
-                except: tun.process.kill()
-            tun.ready = False; tun.process = None; tun.entry_ip = ""; tun.egress_ip = ""
+            _clear_tunnel(tun)
     proxy_server.ACTIVE_BINDS.pop(reg.port, None)
 
 def teardown_region(reg):
     print(f"[*] 移除地区 [{reg.idx}]: {reg.country}", flush=True)
     for tun in [reg.main, reg.backup]:
-        if tun.process:
-            try: tun.process.terminate(); tun.process.wait(2)
-            except: tun.process.kill()
+        _clear_tunnel(tun)
         subprocess.run(["ip", "rule", "del", "pref", str(tun.table_id)], capture_output=True)
         subprocess.run(["ip", "rule", "del", "pref", str(tun.table_id + 1000)], capture_output=True)
         subprocess.run(["ip", "route", "flush", "table", str(tun.table_id)], capture_output=True)
@@ -449,6 +495,22 @@ def harvest_snapshot_nodes() -> list:
         return nodes
     except Exception as e: return []
 
+def _emergency_harvest(country, reason="候选不足"):
+    global global_node_reservoir, dead_ips
+    print(f"[!] ⚡ 紧急收割节点快照 [{country}]，原因: {reason}", flush=True)
+    snapshot = harvest_snapshot_nodes()
+    if not snapshot:
+        print(f"[-] 紧急收割 [{country}] 失败：vpngate 返回空，稍后由定时循环重试", flush=True)
+        return
+    added = 0
+    with reservoir_lock:
+        for n in snapshot:
+            if n["ip"] not in dead_ips:
+                global_node_reservoir[n["ip"]] = n
+                added += 1
+        total = len(global_node_reservoir)
+    print(f"[+] 紧急收割 [{country}] 完成，新增 {added} 个节点，蓄水池总计 {total} 个", flush=True)
+
 def vpngate_fetch_loop():
     global global_node_reservoir, dead_ips
     while True:
@@ -533,6 +595,8 @@ def connect_node(tun: Tunnel, node: dict, region: Region = None):
                 dead_ips.add(node["ip"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
+                if region:
+                    _trigger_emergency_harvest(region.country, f"{tun.name} TestISP 质检失败")
                 return
 
             print(f"[*] {tun.name} 进行流媒体质检 (YouTube)...", flush=True)
@@ -542,6 +606,8 @@ def connect_node(tun: Tunnel, node: dict, region: Region = None):
                 dead_ips.add(node["ip"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
+                if region:
+                    _trigger_emergency_harvest(region.country, f"{tun.name} YouTube 质检失败")
                 return
 
             with state_lock:
@@ -553,7 +619,8 @@ def connect_node(tun: Tunnel, node: dict, region: Region = None):
                 tun.connected_at = time.time()
                 tun.ready = True
                 if region:
-                    proxy_server.ACTIVE_BINDS[region.port] = tun.name
+                    if not _select_active_tunnel_locked(region):
+                        proxy_server.ACTIVE_BINDS[region.port] = tun.name
                     role = "活跃" if proxy_server.ACTIVE_BINDS.get(region.port) == tun.name else "备用"
                     print(f"[+] 地区 [{region.idx}] {tun.name} ({role}) 就绪: 入口 {node['ip']} -> 出口 {egress_ip}", flush=True)
                 else:
@@ -562,114 +629,198 @@ def connect_node(tun: Tunnel, node: dict, region: Region = None):
             try: process.terminate(); process.wait(2)
             except: process.kill()
             dead_ips.add(node["ip"])
+            if region:
+                _trigger_emergency_harvest(region.country, f"{tun.name} 拨号失败")
     finally:
         with state_lock: tun.is_connecting = False
 
-def _health_check_region(reg):
-    active_name = proxy_server.ACTIVE_BINDS.get(reg.port)
-    if not active_name: return
-    active_tun = reg.main if reg.main.name == active_name else reg.backup
-    if not (active_tun.ready and active_tun.process and active_tun.process.poll() is None): return
-    if time.time() - active_tun.connected_at <= 20: return
-    target_tun = active_tun.name
-    endpoints = ["http://www.gstatic.com/generate_204", "http://cp.cloudflare.com/generate_204", "http://1.1.1.1", "http://8.8.8.8"]
-    is_alive = False
+def _probe_active_tunnel(reg, active_tun):
+    if not _is_tunnel_live(active_tun):
+        return False, "活跃通道进程已死"
+    s = None
+    try:
+        s = socket.create_connection(("127.0.0.1", reg.port), timeout=5)
+        s.settimeout(8)
+        def _recv_exact(n):
+            buf = b""
+            while len(buf) < n:
+                chunk = s.recv(n - len(buf))
+                if not chunk: raise OSError("连接中断")
+                buf += chunk
+            return buf
+        user = proxy_server.PROXY_USER
+        pw = proxy_server.PROXY_PASS
+        s.sendall(b"\\x05\\x01\\x02")
+        if _recv_exact(2) != b"\\x05\\x02":
+            return False, "socks5方法协商失败"
+        s.sendall(b"\\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
+        if _recv_exact(2) != b"\\x01\\x00":
+            return False, "代理认证失败"
+        host = b"www.gstatic.com"
+        s.sendall(b"\\x05\\x01\\x00\\x03" + bytes([len(host)]) + host + b"\\x00\\x50")
+        rep = _recv_exact(4)
+        if rep[1] != 0x00:
+            return False, f"CONNECT被拒(rep={rep[1]})"
+        if rep[3] == 0x01: _recv_exact(6)
+        elif rep[3] == 0x03: _recv_exact(1 + _recv_exact(1)[0] + 2)
+        elif rep[3] == 0x04: _recv_exact(18)
+        s.sendall(b"HEAD /generate_204 HTTP/1.0\\r\\nHost: www.gstatic.com\\r\\n\\r\\n")
+        data = s.recv(128)
+        if data and (b"204" in data[:40] or b"200" in data[:40]):
+            return True, "端到端可达"
+        return False, "无HTTP响应"
+    except Exception as e:
+        return False, f"探针异常:{e}"
+    finally:
+        if s:
+            try: s.close()
+            except: pass
+
+def _probe_standby_tunnel(tun):
+    if not _is_tunnel_live(tun):
+        return False, "通道进程已死"
+    endpoints = ["http://www.gstatic.com/generate_204", "http://cp.cloudflare.com/generate_204", "http://1.1.1.1"]
     for ep in endpoints:
-        res = subprocess.run(["curl", "-I", "-s", "-m", "5", "--interface", target_tun, ep], capture_output=True)
+        res = subprocess.run(["curl", "-I", "-s", "-m", "5", "--interface", tun.name, ep], capture_output=True)
         if res.returncode == 0:
-            is_alive = True
-            break
-    if not is_alive:
-        ping_res = subprocess.run(["ping", "-c", "2", "-W", "3", "-I", target_tun, "8.8.8.8"], capture_output=True)
-        if ping_res.returncode == 0: is_alive = True
-    return is_alive, active_tun
+            return True, "直连探针可达"
+    ping_res = subprocess.run(["ping", "-c", "1", "-W", "3", "-I", tun.name, "8.8.8.8"], capture_output=True)
+    if ping_res.returncode == 0:
+        return True, "ICMP可达"
+    return False, "直连探针无响应"
+
+def _health_check_region(reg):
+    checks = []
+    with state_lock:
+        active_tun = _select_active_tunnel_locked(reg)
+        for tun in [reg.main, reg.backup]:
+            if not _is_tunnel_live(tun):
+                continue
+            if time.time() - tun.connected_at <= 3:
+                continue
+            checks.append((tun, tun == active_tun))
+    results = []
+    for tun, is_active in checks:
+        if is_active:
+            is_alive, reason = _probe_active_tunnel(reg, tun)
+        else:
+            is_alive, reason = _probe_standby_tunnel(tun)
+        results.append((is_alive, tun, reason, is_active))
+    return results
 
 def health_check_loop():
     global dead_ips
     fail_counts = {}
     while True:
-        time.sleep(15)
+        time.sleep(10)
         with regions_lock:
-            for reg in list(regions.values()):
-                rid = reg.idx
-                result = _health_check_region(reg)
-                if result is None:
-                    fail_counts[rid] = 0
-                    continue
-                is_alive, active_tun = result
+            regs = list(regions.values())
+        for reg in regs:
+            rid = reg.idx
+            results = _health_check_region(reg)
+            live_keys = set()
+            for is_alive, tun, reason, was_active in results:
+                key = (rid, tun.name, tun.entry_ip or "")
+                live_keys.add(key)
                 if not is_alive:
-                    fail_counts[rid] = fail_counts.get(rid, 0) + 1
-                    if fail_counts[rid] >= 3:
-                        print(f"[!] 地区 [{rid}] {active_tun.name} 连续 {fail_counts[rid]} 次探针无响应，执行踢线: {active_tun.entry_ip}", flush=True)
-                        dead_ips.add(active_tun.entry_ip)
-                        proc_ref = active_tun.process
-                        try: proc_ref.terminate(); proc_ref.wait(timeout=2)
-                        except: proc_ref.kill()
-                        with state_lock: active_tun.ready = False
-                        fail_counts[rid] = 0
+                    fail_counts[key] = fail_counts.get(key, 0) + 1
+                    if fail_counts[key] >= HEALTH_FAIL_THRESHOLD:
+                        role = "ACTIVE" if was_active else "STANDBY"
+                        print(f"[!] 地区 [{rid}] {tun.name}({role}) 连续 {fail_counts[key]} 次探针失败({reason})，立即踢线并补新 IP: {tun.entry_ip}", flush=True)
+                        with state_lock:
+                            failed_ip = tun.entry_ip
+                            if failed_ip: dead_ips.add(failed_ip)
+                            _clear_tunnel(tun)
+                            if proxy_server.ACTIVE_BINDS.get(reg.port) == tun.name:
+                                proxy_server.ACTIVE_BINDS.pop(reg.port, None)
+                            new_active = _select_active_tunnel_locked(reg)
+                            if was_active and new_active:
+                                print(f"[*] ⚡ 地区 [{rid}] Active 故障已秒切至备用: {new_active.egress_ip or new_active.entry_ip}", flush=True)
+                        fail_counts.pop(key, None)
+                        _trigger_emergency_harvest(reg.country, f"{tun.name} 连续探针失败")
                     else:
-                        print(f"[*] 地区 [{rid}] {active_tun.name} 探针无响应，复核容错 ({fail_counts[rid]}/3)...", flush=True)
+                        print(f"[*] 地区 [{rid}] {tun.name} 探针失败({reason})，复核容错 ({fail_counts[key]}/{HEALTH_FAIL_THRESHOLD})...", flush=True)
                 else:
-                    fail_counts[rid] = 0
+                    fail_counts.pop(key, None)
+            for key in list(fail_counts.keys()):
+                if key[0] == rid and key not in live_keys:
+                    fail_counts.pop(key, None)
+
+def _collect_active_ips():
+    active_ips = set()
+    for reg in regions.values():
+        if reg.main.entry_ip: active_ips.add(reg.main.entry_ip)
+        if reg.backup.entry_ip: active_ips.add(reg.backup.entry_ip)
+    return active_ips
 
 def get_best_candidate_for(country: str):
+    active_ips = _collect_active_ips()
     with reservoir_lock:
         all_nodes = sorted(list(global_node_reservoir.values()), key=lambda x: x["ping"])
         candidates = [n for n in all_nodes if n["country"] == country and n["ip"] not in dead_ips]
-        active_ips = set()
-        for reg in regions.values():
-            if reg.main.entry_ip: active_ips.add(reg.main.entry_ip)
-            if reg.backup.entry_ip: active_ips.add(reg.backup.entry_ip)
         candidates = [n for n in candidates if n["ip"] not in active_ips]
+        if 0 < len(candidates) < LOW_WATERMARK_PER_COUNTRY:
+            _trigger_emergency_harvest(country, f"候选低水位 {len(candidates)}/{LOW_WATERMARK_PER_COUNTRY}")
         if not candidates:
-            if any(n["country"] == country for n in all_nodes):
-                dead_ips.clear()
-                print(f"[!] ⚡ 紧急熔断：[{country}] 节点枯竭，解锁黑名单！", flush=True)
+            _trigger_emergency_harvest(country, "候选枯竭")
+            country_ips = {n["ip"] for n in all_nodes if n["country"] == country}
+            if country_ips:
+                dead_ips.difference_update(country_ips)
+                print(f"[!] ⚡ 紧急熔断：[{country}] 候选枯竭，仅解锁该国家黑名单！", flush=True)
                 candidates = [n for n in all_nodes if n["country"] == country and n["ip"] not in active_ips]
         if candidates: return candidates.pop(0)
     return None
 
+def _available_candidate_count(country: str):
+    active_ips = _collect_active_ips()
+    with reservoir_lock:
+        return len([
+            n for n in global_node_reservoir.values()
+            if n["country"] == country and n["ip"] not in dead_ips and n["ip"] not in active_ips
+        ])
+
 def _maintain_region(reg):
+    candidate_count = _available_candidate_count(reg.country)
+    if 0 < candidate_count < LOW_WATERMARK_PER_COUNTRY:
+        _trigger_emergency_harvest(reg.country, f"候选低水位 {candidate_count}/{LOW_WATERMARK_PER_COUNTRY}")
+    elif candidate_count == 0:
+        _trigger_emergency_harvest(reg.country, "候选枯竭")
     with state_lock:
-        main_dead = (reg.main.process is None or reg.main.process.poll() is not None or not reg.main.ready)
-        if main_dead:
-            if reg.backup.ready and reg.backup.process and reg.backup.process.poll() is None:
-                print(f"[*] ⚡ 地区 [{reg.idx}] 主通道暴毙，软开关秒切至备用: {reg.backup.egress_ip or reg.backup.entry_ip}", flush=True)
-                reg.main, reg.backup = reg.backup, reg.main
-                proxy_server.ACTIVE_BINDS[reg.port] = reg.main.name
-                if reg.backup.process:
-                    try: reg.backup.process.terminate(); reg.backup.process.wait(2)
-                    except: reg.backup.process.kill()
-                reg.backup.process = None; reg.backup.node = None; reg.backup.entry_ip = ""; reg.backup.egress_ip = ""
-                reg.backup.ready = False; reg.backup.is_connecting = False
-            else:
-                if reg.main.process:
-                    try: reg.main.process.terminate(); reg.main.process.wait(2)
-                    except: reg.main.process.kill()
-                reg.main.process = None; reg.main.ready = False; reg.main.is_connecting = False
-                reg.main.entry_ip = ""; reg.main.egress_ip = ""
-                proxy_server.ACTIVE_BINDS.pop(reg.port, None)
-    with state_lock:
-        needs_main = not reg.main.ready and not reg.main.is_connecting
-        needs_backup = not reg.backup.ready and not reg.backup.is_connecting
-    if needs_main:
+        for tun in [reg.main, reg.backup]:
+            if tun.ready and (not tun.process or tun.process.poll() is not None):
+                print(f"[!] 地区 [{reg.idx}] {tun.name} 进程已退出，清理后准备补新: {tun.entry_ip}", flush=True)
+                if tun.entry_ip: dead_ips.add(tun.entry_ip)
+                _clear_tunnel(tun, kill_process=False)
+                if proxy_server.ACTIVE_BINDS.get(reg.port) == tun.name:
+                    proxy_server.ACTIVE_BINDS.pop(reg.port, None)
+        active_tun = _select_active_tunnel_locked(reg)
+        live_tuns = [tun for tun in [reg.main, reg.backup] if _is_tunnel_live(tun)]
+        if live_tuns:
+            reg.connect_fail_streak = 0
+        empty_tuns = [tun for tun in [reg.main, reg.backup] if not _is_tunnel_live(tun) and not tun.is_connecting]
+        if not active_tun:
+            reason = "缺少 Active"
+            tun = empty_tuns[0] if empty_tuns else None
+        elif len(live_tuns) < 2:
+            reason = "补齐 Standby"
+            tun = empty_tuns[0] if empty_tuns else None
+        else:
+            tun = None
+            reason = ""
+    if tun:
         node = get_best_candidate_for(reg.country)
         if node:
-            with state_lock: reg.main.is_connecting = True
-            threading.Thread(target=connect_node, args=(reg.main, node, reg), daemon=True).start()
-            time.sleep(1)
-    elif needs_backup:
-        node = get_best_candidate_for(reg.country)
-        if node:
-            with state_lock: reg.backup.is_connecting = True
-            threading.Thread(target=connect_node, args=(reg.backup, node, reg), daemon=True).start()
+            reg.connect_fail_streak = 0
+            with state_lock: tun.is_connecting = True
+            print(f"[*] 地区 [{reg.idx}] {reason}，开始拨号补新节点: {node['ip']} ({reg.country})", flush=True)
+            threading.Thread(target=connect_node, args=(tun, node, reg), daemon=True).start()
+        else:
+            reg.connect_fail_streak += 1
+            print(f"[!] 地区 [{reg.idx}] {reason} 但选不到候选节点，立即触发紧急收割 [{reg.country}]", flush=True)
+            _trigger_emergency_harvest(reg.country, f"{reason} 无候选")
 
 def maintain_pool():
-    global dead_ips, last_blacklist_clear
     while True:
-        if time.time() - last_blacklist_clear > 600:
-            dead_ips.clear()
-            last_blacklist_clear = time.time()
         with reservoir_lock:
             now = time.time()
             stale_ips = [ip for ip, node in global_node_reservoir.items() if now - node["harvested_at"] > 10800]
